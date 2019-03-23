@@ -1,30 +1,28 @@
 package notifier
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/skroutz/downloader/backend"
 	"github.com/skroutz/downloader/job"
 	"github.com/skroutz/downloader/stats"
 	"github.com/skroutz/downloader/storage"
 )
 
 const (
-	maxCallbackRetries = 2
-
+	maxCallbackRetries       = 2
+	deliveryMonitors         = 2
 	statsFailedCallbacks     = "failedCallbacks"     //Counter
 	statsSuccessfulCallbacks = "successfulCallbacks" //Counter
 )
@@ -37,34 +35,7 @@ var (
 
 	// RetryBackoffDuration indicates the time to wait between retries.
 	RetryBackoffDuration = 10 * time.Minute
-
-	// Based on http.DefaultTransport
-	//
-	// See https://golang.org/pkg/net/http/#RoundTripper
-	notifierTransport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second, // was 30 * time.Second
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
 )
-
-// CallbackInfo holds info to be posted back to the provided callback url.
-type CallbackInfo struct {
-	Success      bool   `json:"success"`
-	Error        string `json:"error"`
-	Extra        string `json:"extra"`
-	ResourceURL  string `json:"resource_url"`
-	DownloadURL  string `json:"download_url"`
-	JobID        string `json:"job_id"`
-	ResponseCode int    `json:"response_code"`
-}
 
 // Notifier is the the component responsible for consuming the result of jobs
 // and notifying back the respective users by issuing HTTP requests to their
@@ -82,7 +53,7 @@ type Notifier struct {
 	stats       *stats.Stats
 
 	// registered backends
-	backends map[string]Backend
+	backends map[string]backend.Backend
 }
 
 func init() {
@@ -103,13 +74,10 @@ func New(s *storage.Storage, concurrency int, logger *log.Logger, dwnlURL string
 		return Notifier{}, errors.New("Notifier Concurrency must be a positive number")
 	}
 
-	httpBackend := &HttpBackend{}
-	httpBackend.Start()
+	httpBackend := &backend.HTTPBackend{}
+	kafkaBackend := &backend.KafkaBackend{}
 
-	kafkaBackend := &KafkaBackend{}
-	kafkaBackend.Start()
-
-	backends := map[string]Backend{
+	backends := map[string]backend.Backend{
 		httpBackend.ID():  httpBackend,
 		kafkaBackend.ID(): kafkaBackend,
 	}
@@ -119,10 +87,6 @@ func New(s *storage.Storage, concurrency int, logger *log.Logger, dwnlURL string
 		Log:         logger,
 		StatsIntvl:  5 * time.Second,
 		concurrency: concurrency,
-		client: &http.Client{
-			Transport: notifierTransport,
-			Timeout:   30 * time.Second, // Larger than Dial + TLS timeouts
-		},
 		cbChan:      make(chan job.Job),
 		DownloadURL: url,
 		backends:    backends,
@@ -141,10 +105,12 @@ func New(s *storage.Storage, concurrency int, logger *log.Logger, dwnlURL string
 
 // Start starts the Notifier loop and instruments the worker goroutines that
 // perform the actual notify requests.
-func (n *Notifier) Start(closeChan chan struct{}) {
+func (n *Notifier) Start(closeChan chan struct{}, cfg map[string]interface{}) {
+	ctx, cancelfunc := context.WithCancel(context.Background())
+
 	for id, backend := range n.backends {
-		fmt.Println("Starting", id, "backend") // TMP
-		backend.Start()
+		fmt.Println("Starting", id, "backend")
+		backend.Start(ctx, cfg[id].(map[string]interface{}))
 	}
 
 	var wg sync.WaitGroup
@@ -153,7 +119,12 @@ func (n *Notifier) Start(closeChan chan struct{}) {
 		go func() {
 			defer wg.Done()
 			for job := range n.cbChan {
-				err := n.Notify(&job)
+				payload, err := n.Prepare(&job)
+				if err != nil {
+					n.Log.Printf("Error while preparing payload: %s", err)
+				}
+
+				err = n.Notify(&job, payload)
 				if err != nil {
 					n.Log.Printf("Notify error: %s", err)
 				}
@@ -164,8 +135,11 @@ func (n *Notifier) Start(closeChan chan struct{}) {
 	// Check Redis for jobs left in InProgress state
 	n.collectRogueCallbacks()
 
-	ctx, cancelfunc := context.WithCancel(context.Background())
 	go n.stats.Run(ctx)
+
+	// Start monitoring delivery reports
+	var deliveriesWaitGroup sync.WaitGroup
+	n.MonitorDeliveries(ctx, deliveryMonitors, &deliveriesWaitGroup)
 
 	for {
 		select {
@@ -173,6 +147,11 @@ func (n *Notifier) Start(closeChan chan struct{}) {
 			close(n.cbChan)
 			wg.Wait()
 			cancelfunc()
+			for _, backend := range n.backends {
+				fmt.Println("Closing", backend.ID(), "backend")
+				backend.Finalize()
+			}
+			deliveriesWaitGroup.Wait()
 			closeChan <- struct{}{}
 			return
 		default:
@@ -241,43 +220,98 @@ func (n *Notifier) collectRogueCallbacks() {
 	}
 }
 
-// Notify posts callback info to j.CallbackURL
-func (n *Notifier) Notify(j *job.Job) error {
+// MonitorDeliveries starts as many go routines as limit instructs in order to
+// poll/monitor the delivery reports channel.
+func (n *Notifier) MonitorDeliveries(ctx context.Context, limit int, dwg *sync.WaitGroup) {
+	dwg.Add(limit)
+
+	for i := 0; i < limit; i++ {
+		go n.monitorDeliveriesRoutine(ctx, dwg)
+	}
+}
+
+// monitorDeliveriesRoutine watches events from the delivery reports channel and
+// also checks whether the context has been cancelled or not.
+func (n *Notifier) monitorDeliveriesRoutine(ctx context.Context, dwg *sync.WaitGroup) {
+	defer dwg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			n.Log.Println("Context has been cancelled")
+			return
+		case httpInfo := <-n.backends["http"].DeliveryReports():
+			n.handleSuccessfullCallback(httpInfo)
+			continue
+		case kafkaInfo := <-n.backends["kafka"].DeliveryReports():
+			n.handleSuccessfullCallback(kafkaInfo)
+			continue
+		}
+	}
+}
+
+// handleSuccessfullCallback handles a successful callback info
+// by incrementing stats counters and removing jobs from storage
+func (n *Notifier) handleSuccessfullCallback(cbInfo job.CallbackInfo) {
+	if cbInfo.Success {
+		err := n.Storage.QueueJobForDeletion(cbInfo.JobID)
+		if err != nil {
+			n.Log.Printf("Error: Could not queue job %s for deletion: %s", cbInfo.JobID, err)
+		}
+
+		n.stats.Add(statsSuccessfulCallbacks, 1)
+
+		err = n.Storage.RemoveJob(cbInfo.JobID)
+		if err != nil {
+			n.Log.Printf("Could not remove job %s. Operation returned error: %s", cbInfo.JobID, err)
+		}
+	}
+
+}
+
+// Prepare runs the necessary actions before calling Notify
+// and returns the payload to be sent.
+func (n *Notifier) Prepare(j *job.Job) ([]byte, error) {
 	j.CallbackCount++
 
 	err := n.markCbInProgress(j)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	cbInfo, err := n.getCallbackInfo(j)
+	cbInfo, err := j.GetCallbackInfo(*n.DownloadURL)
 	if err != nil {
-		return n.markCbFailed(j, err.Error())
+		return nil, n.markCbFailed(j, err.Error())
 	}
 
-	cb, err := json.Marshal(cbInfo)
+	cbPayload, err := json.Marshal(cbInfo)
 	if err != nil {
-		return n.markCbFailed(j, err.Error())
+		return nil, n.markCbFailed(j, err.Error())
 	}
 
-	n.Log.Println("Performing callback request for", j, "...")
-	res, err := n.client.Post(j.CallbackURL, "application/json", bytes.NewBuffer(cb))
-	if err != nil || res.StatusCode < 200 || res.StatusCode >= 300 {
-		if err == nil {
-			err = fmt.Errorf("Received Status: %s", res.Status)
-		}
-		return n.retryOrFail(j, err.Error())
-	}
+	return cbPayload, nil
+}
 
-	if res.StatusCode == http.StatusAccepted {
-		err := n.Storage.QueueJobForDeletion(j.ID)
+// Notify posts callback info to job's destination by calling Notify
+// on each backend.
+func (n *Notifier) Notify(j *job.Job, payload []byte) error {
+	n.Log.Println("Performing callback action for", j, "...")
+
+	cbType, cbDst := j.GetCallbackTypeAndDestination()
+
+	if cbType == "http" {
+		err := n.backends["http"].Notify(cbDst, payload)
 		if err != nil {
-			n.Log.Println("Error: Could not queue job for deletion", err)
+			return n.retryOrFail(j, err.Error())
+		}
+	} else {
+		err := n.backends["kafka"].Notify(cbDst, payload)
+		if err != nil {
+			return n.retryOrFail(j, err.Error())
 		}
 	}
 
-	n.stats.Add(statsSuccessfulCallbacks, 1)
-	return n.Storage.RemoveJob(j.ID)
+	return nil
 }
 
 // retryOrFail checks the callback count of the current download
@@ -290,34 +324,6 @@ func (n *Notifier) retryOrFail(j *job.Job, err string) error {
 
 	n.Log.Printf("Warn: Callback try no:%d failed for job:%s with: %s", j.CallbackCount, j, err)
 	return n.Storage.QueuePendingCallback(j, time.Duration(j.CallbackCount)*RetryBackoffDuration)
-}
-
-// callbackInfo validates that the job is good for callback and
-// return callbackInfo to the caller
-func (n *Notifier) getCallbackInfo(j *job.Job) (CallbackInfo, error) {
-	if j.DownloadState != job.StateSuccess && j.DownloadState != job.StateFailed {
-		return CallbackInfo{}, fmt.Errorf("Invalid job download state: '%s'", j.DownloadState)
-	}
-
-	return CallbackInfo{
-		Success:      j.DownloadState == job.StateSuccess,
-		Error:        j.DownloadMeta,
-		Extra:        j.Extra,
-		ResourceURL:  j.URL,
-		DownloadURL:  jobDownloadURL(j, *n.DownloadURL),
-		JobID:        j.ID,
-		ResponseCode: j.ResponseCode,
-	}, nil
-}
-
-// jobdownloadURL constructs the actual download URL to be provided to the user.
-func jobDownloadURL(j *job.Job, downloadURL url.URL) string {
-	if j.DownloadState != job.StateSuccess {
-		return ""
-	}
-
-	downloadURL.Path = path.Join(downloadURL.Path, j.Path())
-	return downloadURL.String()
 }
 
 func (n *Notifier) markCbInProgress(j *job.Job) error {

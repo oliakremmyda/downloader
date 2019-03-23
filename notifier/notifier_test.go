@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/skroutz/downloader/job"
 	"github.com/skroutz/downloader/storage"
@@ -60,6 +61,15 @@ func TestNotifyJobDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	cfg := map[string]interface{}{
+		"http": map[string]interface{}{},
+		"kafka": map[string]interface{}{
+			"bootstrap.servers": "localhost",
+		},
+	}
+	ch := make(chan struct{})
+	go notifier.Start(ch, cfg)
+
 	for _, tc := range testcases {
 		err := store.QueuePendingCallback(tc.j, 0)
 		if err != nil {
@@ -74,10 +84,7 @@ func TestNotifyJobDeletion(t *testing.T) {
 			t.Fatalf("Expected job with id %s to exist in Redis", tc.j.ID)
 		}
 
-		err = notifier.Notify(tc.j)
-		if err != nil {
-			t.Fatal(err)
-		}
+		time.Sleep(2 * time.Second)
 
 		exists, err = store.JobExists(tc.j)
 		if err != nil {
@@ -87,6 +94,9 @@ func TestNotifyJobDeletion(t *testing.T) {
 			t.Fatalf("Expected job exist to be %v", tc.shouldExist)
 		}
 	}
+
+	ch <- struct{}{}
+	<-ch
 }
 
 func TestRogueCollection(t *testing.T) {
@@ -123,9 +133,15 @@ func TestRogueCollection(t *testing.T) {
 		}
 	}
 
+	cfg := map[string]interface{}{
+		"http": map[string]interface{}{},
+		"kafka": map[string]interface{}{
+			"bootstrap.servers": "localhost",
+		},
+	}
 	//start and close Notifier
 	ch := make(chan struct{})
-	go notifier.Start(ch)
+	go notifier.Start(ch, cfg)
 	ch <- struct{}{}
 	<-ch
 
