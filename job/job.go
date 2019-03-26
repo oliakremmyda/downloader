@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"strings"
 
 	"github.com/skroutz/downloader/processor/mimetype"
 )
@@ -51,6 +52,8 @@ type Job struct {
 	DownloadMeta string `json:"-"`
 
 	CallbackState State  `json:"-"`
+	CallbackType  string `json:"callback_type"`
+	CallbackDst   string `json:"callback_dst"`
 	CallbackURL   string `json:"callback_url"`
 
 	// Auxiliary ad-hoc information used for debugging.
@@ -110,14 +113,50 @@ func (j *Job) UnmarshalJSON(b []byte) error {
 	j.AggrID = aggrID
 
 	cbURL, ok := tmp["callback_url"].(string)
-	if !ok {
-		return errors.New("callback_url must be a string")
+	if ok {
+		_, err = url.ParseRequestURI(cbURL)
+		if err != nil {
+			return errors.New("Could not parse callback URL: " + err.Error())
+		}
+		j.CallbackURL = cbURL
 	}
-	_, err = url.ParseRequestURI(cbURL)
-	if err != nil {
-		return errors.New("Could not parse callback URL: " + err.Error())
+
+	// Check if callback_type and callback_dst are present
+	// only if callback_url is empty
+	if j.CallbackURL == "" {
+		cbType, ok := tmp["callback_type"].(string)
+		if ok && cbType == "" {
+			return errors.New("Since callback_url is absent, callback_type cannot be empty")
+		}
+
+		if !ok {
+			return errors.New("callback_type must be a string")
+		}
+
+		j.CallbackType = cbType
+
+		cbDestination, ok := tmp["callback_dst"].(string)
+		if ok && cbDestination == "" {
+			return errors.New("Since callback_url is absent, callback_dst cannot be empty")
+		}
+
+		if !ok {
+			return errors.New("callback_dst must be a string")
+		}
+
+		if strings.HasPrefix(cbDestination, "http") {
+			_, err = url.ParseRequestURI(cbDestination)
+			if err != nil {
+				return errors.New("Could not parse URL: " + err.Error())
+			}
+		}
+		j.CallbackDst = cbDestination
 	}
-	j.CallbackURL = cbURL
+
+	// Do a final check for the callback information
+	if j.CallbackURL == "" && j.CallbackType == "" && j.CallbackDst == "" {
+		return errors.New("You need to provide either callback_url OR callback_type and callback_dst")
+	}
 
 	extra, ok := tmp["extra"].(string)
 	if ok {
@@ -139,6 +178,29 @@ func (j *Job) UnmarshalJSON(b []byte) error {
 	j.MimeType = ""
 
 	return nil
+}
+
+// GetCallbackInfo validates the state of a job and returns a callback info
+// along with an error if appropriate
+func (j *Job) GetCallbackInfo(downloadURL url.URL) (CallbackInfo, error) {
+	if j.DownloadState != StateSuccess && j.DownloadState != StateFailed {
+		return CallbackInfo{}, fmt.Errorf("Invalid job download state: '%s'", j.DownloadState)
+	}
+
+	downloadURL.Path = path.Join(downloadURL.Path, j.Path())
+	return NewCallbackInfo(j.DownloadState == StateSuccess, j.DownloadMeta, j.Extra,
+		j.URL, downloadURL.String(), j.ID, j.ResponseCode), nil
+}
+
+// GetCallbackTypeAndDestination returns callback type and destination from either
+// the job's callback_url or callback_type and callback_dst.
+// When callback_url is present then as callback type the "http" is returned.
+func (j *Job) GetCallbackTypeAndDestination() (string, string) {
+	if j.CallbackURL != "" {
+		return "http", j.CallbackURL
+	}
+
+	return j.CallbackType, j.CallbackDst
 }
 
 func (j Job) String() string {
