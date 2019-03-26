@@ -30,6 +30,13 @@ type Config struct {
 		Concurrency   int    `json:"concurrency"`
 		StatsInterval int    `json:"stats_interval"`
 	} `json:"notifier"`
+
+	Backends struct {
+		Kafka struct {
+			BootstrapServers string `json:"bootstrap.servers"`
+		} `json:"kafka"`
+		HTTP struct{} `json:"http"`
+	} `json:"backends"`
 }
 
 func parseCliConfig(ctx *cli.Context) error {
@@ -48,4 +55,13 @@ func parseConfig(filename string) error {
 	dec.Decode(&cfg)
 
 	return nil
+}
+
+// StructToMap converts a Config struct to a map
+func StructToMap(cfg *Config) map[string]interface{} {
+	var res map[string]interface{}
+	cfgBytes, _ := json.Marshal(cfg)
+	json.Unmarshal(cfgBytes, &res)
+
+	return res
 }
