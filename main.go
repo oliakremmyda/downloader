@@ -185,8 +185,9 @@ func main() {
 					notifier.StatsIntvl = time.Duration(cfg.Notifier.StatsInterval) * time.Millisecond
 				}
 
+				cfgMap := StructToMap(&cfg)
 				closeChan := make(chan struct{})
-				go notifier.Start(closeChan)
+				go notifier.Start(closeChan, cfgMap["backends"].(map[string]interface{}))
 
 				<-sigCh
 				notifier.Log.Println("Shutting down...")
