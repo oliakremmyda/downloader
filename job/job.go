@@ -64,6 +64,9 @@ type Job struct {
 
 	// Mime type pattern provided by the client
 	MimeType string `json:"mime_type"`
+
+	// The User-Agent to set in download requests
+	UserAgent string `json:"user_agent"`
 }
 
 // State represents the download & callback states.
@@ -138,10 +141,21 @@ func (j *Job) UnmarshalJSON(b []byte) error {
 	}
 	j.MimeType = ""
 
+	var useragent string
+	if useragentField, ok := tmp["user_agent"]; !ok {
+		useragent = "" // The attribute is missing, Use the default value
+	} else {
+		useragent, ok = useragentField.(string)
+		if !ok {
+			return errors.New("UserAgent must be a string")
+		}
+	}
+	j.UserAgent = useragent
+
 	return nil
 }
 
 func (j Job) String() string {
-	return fmt.Sprintf("Job{ID:%s, Aggr:%s, URL:%s, callback_url:%s}",
-		j.ID, j.AggrID, j.URL, j.CallbackURL)
+	return fmt.Sprintf("Job{ID:%s, Aggr:%s, URL:%s, callback_url:%s, UserAgent:%s}",
+		j.ID, j.AggrID, j.URL, j.CallbackURL, j.UserAgent)
 }
