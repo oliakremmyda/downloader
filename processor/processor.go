@@ -402,7 +402,7 @@ func (p *Processor) collectRogueDownloads() {
 func (p *Processor) newWorkerPool(aggr job.Aggregation) (workerPool, error) {
 	logPrefix := fmt.Sprintf("%s[worker pool:%s] ", p.Log.Prefix(), aggr.ID)
 
-	client, err := getClient(aggr.Proxy)
+	client, err := getClient(aggr.Proxy, aggr.Timeout)
 	if err != nil {
 		return workerPool{}, err
 	}
@@ -773,7 +773,8 @@ func httpTransport(proxy *url.URL) *http.Transport {
 	}
 }
 
-func getClient(proxy string) (*http.Client, error) {
+func getClient(proxy string, timeout int) (*http.Client, error) {
+	timeoutDuration := time.Duration(timeout)
 
 	var proxyURL *url.URL
 	var err error
@@ -786,6 +787,6 @@ func getClient(proxy string) (*http.Client, error) {
 
 	return &http.Client{
 		Transport: httpTransport(proxyURL),
-		Timeout:   10 * time.Second,
+		Timeout:   timeoutDuration * time.Second,
 	}, nil
 }

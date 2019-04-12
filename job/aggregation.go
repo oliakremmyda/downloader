@@ -6,6 +6,9 @@ import (
 	"net/url"
 )
 
+// Timeout for http client that will handle the download, in seconds
+var defaultTimeout = 10
+
 // Aggregation is the concept through which the rate limit rules are defined
 // and enforced.
 type Aggregation struct {
@@ -16,11 +19,14 @@ type Aggregation struct {
 
 	// Proxy url for the client to use, optional
 	Proxy string `json:"aggr_proxy"`
+
+	// Client timeout in seconds
+	Timeout int `json:"aggr_timeout"`
 }
 
 // NewAggregation creates an aggregation with the provided ID and limit.
 // If any of the prerequisites fail, an error is returned.
-func NewAggregation(id string, limit int, proxy string) (*Aggregation, error) {
+func NewAggregation(id string, limit int, proxy string, timeout int) (*Aggregation, error) {
 	if id == "" {
 		return nil, errors.New("Aggregation ID cannot be empty")
 	}
@@ -32,7 +38,11 @@ func NewAggregation(id string, limit int, proxy string) (*Aggregation, error) {
 		return nil, errors.New("Aggregation proxy must be valid")
 	}
 
-	return &Aggregation{ID: id, Limit: limit, Proxy: proxy}, nil
+	if timeout <= 0 {
+		return nil, errors.New("Aggregation timeout must be greater than 0")
+	}
+
+	return &Aggregation{ID: id, Limit: limit, Proxy: proxy, Timeout: timeout}, nil
 }
 
 // UnmarshalJSON populates the aggregation with the values in the provided JSON.
@@ -71,9 +81,25 @@ func (a *Aggregation) UnmarshalJSON(b []byte) error {
 		}
 	}
 
+	var timeout int
+	timeoutS, ok := tmp["aggr_timeout"]
+	if !ok {
+		timeout = defaultTimeout // The attribute is missing. Use the default value
+	} else {
+		timeoutf, ok := timeoutS.(float64) // The attribute is given, validate it.
+		if !ok {
+			return errors.New("Aggregation timeout must be a number")
+		}
+		timeout := int(timeoutf)
+		if timeout <= 0 {
+			return errors.New("Aggregation timeout must be greater than 0")
+		}
+	}
+
 	a.ID = id
 	a.Limit = limit
 	a.Proxy = proxy
+	a.Timeout = timeout
 
 	return nil
 }

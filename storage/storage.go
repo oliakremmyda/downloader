@@ -265,7 +265,7 @@ func (s *Storage) GetAggregation(id string) (*job.Aggregation, error) {
 	}
 
 	if v, ok := val["ID"]; !ok || v == "" {
-		aggr, err := job.NewAggregation(id, aggrDefaultLimit, "")
+		aggr, err := job.NewAggregation(id, aggrDefaultLimit, "", 10)
 		if err != nil {
 			return nil, err
 		}
@@ -308,6 +308,11 @@ func AggregationFromMap(m map[string]string) (job.Aggregation, error) {
 			}
 		case "Proxy":
 			aggr.Proxy = v
+		case "Timeout":
+			aggr.Timeout, err = strconv.Atoi(v)
+			if err != nil {
+				return aggr, fmt.Errorf("Could not decode struct from map: %v", err)
+			}
 		default:
 			return aggr, fmt.Errorf("Field %s with value %s was not found in Aggregarion struct", k, v)
 		}

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/skroutz/downloader/job"
 	"github.com/skroutz/downloader/processor/mimetype"
@@ -60,7 +61,7 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a, err := job.NewAggregation("proxyfoo", 2, "http://www.example.com")
+	a, err := job.NewAggregation("proxyfoo", 2, "http://www.example.com", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +89,30 @@ func TestProxy(t *testing.T) {
 
 	if actual != a.Proxy {
 		t.Fatalf("Expected Proxy to be %s, got %s", a.Proxy, actual)
+	}
+	wg.Wait()
+}
+
+func TestClientTimeout(t *testing.T) {
+	var wg sync.WaitGroup
+	//Since we are messing with the default settings, we create a new processor here
+	p, err := New(store, 1, storageDir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := job.NewAggregation("proxyfoo", 2, "http://www.example.com", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SaveAggregation(a)
+	wp, err := p.newWorkerPool(*a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := int(wp.client.Timeout / time.Second)
+	if actual != a.Timeout {
+		t.Fatalf("Expected Timeout to be %d, got %d", a.Timeout, actual)
 	}
 	wg.Wait()
 }

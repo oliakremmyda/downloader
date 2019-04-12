@@ -29,7 +29,7 @@ var (
 	logger           = log.New(os.Stderr, "[test processor]", log.Ldate|log.Ltime|log.Lshortfile)
 	mux              = http.NewServeMux()
 	server           = httptest.NewServer(mux)
-	defaultAggr, _   = job.NewAggregation("FooBar", 1, "")
+	defaultAggr, _   = job.NewAggregation("FooBar", 1, "", 10)
 	defaultProcessor Processor
 	defaultWP        workerPool
 	testCfg          = "../config.test.json"
@@ -267,7 +267,7 @@ func TestChecker(t *testing.T) {
 	testChecker.Sick()
 	time.Sleep(10 * time.Millisecond)
 
-	a, _ := job.NewAggregation("foobar", 2, "")
+	a, _ := job.NewAggregation("foobar", 2, "", 10)
 	store.SaveAggregation(a)
 
 	jobs := []job.Job{
